@@ -29,11 +29,14 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+
+
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QListWidget, QListWidgetItem, QLabel, QCheckBox, QComboBox,
-    QDoubleSpinBox, QFileDialog, QGroupBox
+    QDoubleSpinBox, QFileDialog, QGroupBox, QLineEdit, QDialog, QDialogButtonBox, 
+    QFormLayout
 )
 from PyQt5.QtWidgets import QOpenGLWidget  # 改为从 QtWidgets 导入
 
@@ -53,15 +56,23 @@ def _downsample_idx(n: int, max_points: int) -> np.ndarray:
     return np.arange(0, n, step)
 
 
-def _to_seconds(series: pd.Series) -> np.ndarray:
-    if np.issubdtype(series.dtype, np.number):
-        return series.astype(float).values
+def _to_seconds(series: pd.Series, col_name: Optional[str] = None) -> np.ndarray:
+    s = series
+    if np.issubdtype(s.dtype, np.number):
+        v = s.astype(float).values
+        name = (col_name or "").lower()
+        # 基于列名或数量级判断单位
+        if "ns" in name or "nanosec" in name or np.nanmedian(v) > 1e12:
+            return v * 1e-9
+        if "ms" in name or "millis" in name or (1e3 < np.nanmedian(v) < 1e9):
+            return v * 1e-3
+        return v  # 视为秒
     try:
-        dt = pd.to_datetime(series, errors="coerce", utc=True)
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
         base = dt.iloc[0]
         return (dt - base).dt.total_seconds().values
     except Exception:
-        return pd.to_numeric(series, errors="coerce").astype(float).values
+        return pd.to_numeric(s, errors="coerce").astype(float).values
 
 
 def ned_to_enu(n: np.ndarray, e: np.ndarray, d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -113,6 +124,10 @@ class Trajectory:
     visible: bool = True
     color_scheme: str = "jetlike"
 
+    # 新增：显式列映射（可选）
+    time_col: Optional[str] = None
+    xyz_cols: Optional[Tuple[str, str, str]] = None
+
     t: Optional[np.ndarray] = None
     xyz: Optional[np.ndarray] = None
     colors: Optional[np.ndarray] = None
@@ -123,9 +138,19 @@ class Trajectory:
         df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
         if df.empty:
             raise RuntimeError("CSV 为空")
-        t_col = _detect_time_col(df)
-        base_frame, cx, cy, cz = _detect_xyz_cols(df)
-        t_raw = _to_seconds(df[t_col])
+        # 1) 时间列
+        if self.time_col and self.time_col in df.columns:
+            t_col = self.time_col
+        else:
+            t_col = _detect_time_col(df)
+        t_raw = _to_seconds(df[t_col], col_name=t_col)
+        # 2) 坐标列
+        if self.xyz_cols and all(c in df.columns for c in self.xyz_cols):
+            cx, cy, cz = self.xyz_cols
+            base_frame = "ENU"  # 明确选择的三元组默认按 ENU 解释
+        else:
+            base_frame, cx, cy, cz = _detect_xyz_cols(df)        
+        
         x_raw = pd.to_numeric(df[cx], errors="coerce").astype(float).values
         y_raw = pd.to_numeric(df[cy], errors="coerce").astype(float).values
         z_raw = pd.to_numeric(df[cz], errors="coerce").astype(float).values
@@ -380,6 +405,133 @@ class GLWidget(QOpenGLWidget):
         self.distance = max(3.0, size * 0.8)
         self.update()
 
+class ColumnMapDialog(QDialog):
+    """
+    读取 CSV 表头后，允许选择：
+      - 时间列
+      - 多个“轨迹映射”（Name, X, Y, Z）
+    支持 Auto Detect：按 *.x/*.y/*.z 前缀分组。
+    """
+    def __init__(self, csv_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Map Columns from CSV")
+        self.resize(600, 360)
+        self.csv_path = csv_path
+        self.df = pd.read_csv(csv_path, nrows=2)  # 看表头足够
+        self.df = self.df.loc[:, ~self.df.columns.astype(str).str.startswith("Unnamed")]
+        cols = [str(c) for c in self.df.columns]
+
+        # 顶部：时间列
+        top = QFormLayout()
+        self.cmb_time = QComboBox()
+        self.cmb_time.addItems(cols)
+        # 预选：尽量挑 t_ns / t_s / time
+        pref = [c for c in cols if c.lower() in ("t_ns","t_s","time","timestamp","seconds","sec","true_time")]
+        if pref:
+            self.cmb_time.setCurrentText(pref[0])
+        top.addRow("Time column:", self.cmb_time)
+
+        # 轨迹区（可增加多条）
+        self.tracks_area = QVBoxLayout()
+        # 控件缓存：[(name_edit, cmb_x, cmb_y, cmb_z), ...]
+        self.track_widgets: List[Tuple[QLineEdit, QComboBox, QComboBox, QComboBox]] = []
+
+        btns_row = QHBoxLayout()
+        self.btn_add_track = QPushButton("Add Track")
+        self.btn_auto = QPushButton("Auto Detect")
+        btns_row.addWidget(self.btn_add_track)
+        btns_row.addWidget(self.btn_auto)
+        self.btn_add_track.clicked.connect(self._add_track_row)
+        self.btn_auto.clicked.connect(self._auto_detect)
+
+        # 先放两条（UAV1 / UAV2）
+        self._add_track_row("UAV1")
+        self._add_track_row("UAV2")
+
+        # 底部按钮
+        self.box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.box.accepted.connect(self.accept)
+        self.box.rejected.connect(self.reject)
+
+        # 布局
+        root = QVBoxLayout(self)
+        gb_top = QGroupBox("Time")
+        gb_top.setLayout(top)
+        gb_trk = QGroupBox("Tracks (each needs X/Y/Z)")
+        lay_trk = QVBoxLayout(); lay_trk.addLayout(self.tracks_area); lay_trk.addLayout(btns_row)
+        gb_trk.setLayout(lay_trk)
+        root.addWidget(gb_top)
+        root.addWidget(gb_trk)
+        root.addWidget(self.box)
+
+        # 预跑一次自动识别
+        self._auto_detect()
+
+    def _add_track_row(self, name: Optional[str] = None):
+        cols = [str(c) for c in self.df.columns]
+        line = QHBoxLayout()
+        name_edit = QLineEdit(name or f"Track{len(self.track_widgets)+1}")
+        cmb_x = QComboBox(); cmb_y = QComboBox(); cmb_z = QComboBox()
+        for cmb in (cmb_x, cmb_y, cmb_z):
+            cmb.setEditable(True)
+            cmb.addItems(cols)
+        line.addWidget(QLabel("Name:")); line.addWidget(name_edit, 1)
+        line.addWidget(QLabel("X:")); line.addWidget(cmb_x, 1)
+        line.addWidget(QLabel("Y:")); line.addWidget(cmb_y, 1)
+        line.addWidget(QLabel("Z:")); line.addWidget(cmb_z, 1)
+        self.tracks_area.addLayout(line)
+        self.track_widgets.append((name_edit, cmb_x, cmb_y, cmb_z))
+
+    def _auto_detect(self):
+        """
+        规则：把以 .x/.y/.z 或 /x,/y,/z 结尾的列，按去掉后缀的前缀进行分组。
+        取前两组填入前两条轨迹。
+        """
+        cols = [str(c) for c in self.df.columns]
+        groups = {}  # key -> {'x':col, 'y':col, 'z':col, 'name':suggest}
+        def key_of(c: str):
+            cl = c.lower()
+            for suf in (".x",".y",".z","/x","/y","/z"):
+                if cl.endswith(suf):
+                    return c[: -len(suf)], suf[-1]
+            return None, None
+
+        for c in cols:
+            k, axis = key_of(c)
+            if k and axis in "xyz":
+                g = groups.setdefault(k, {})
+                g[axis] = c
+                # 取名字建议：key 最后一个 path 片段
+                parts = k.split("/")
+                g.setdefault("name", parts[-1] if parts and parts[-1] else k)
+
+        # 把完整 xyz 的组挑出来
+        complete = [(k, g) for k, g in groups.items() if all(a in g for a in "xyz")]
+        # 排序：稳定即可
+        complete.sort(key=lambda kv: kv[0])
+
+        for i, (_, g) in enumerate(complete[: len(self.track_widgets)]):
+            name_edit, cx, cy, cz = self.track_widgets[i]
+            name_edit.setText(str(g.get("name","Track")))
+            cx.setCurrentText(g['x']); cy.setCurrentText(g['y']); cz.setCurrentText(g['z'])
+
+        # 时间列也顺带优选 t_ns/t_s
+        for pref in ("t_ns","t_s","time","timestamp"):
+            for c in cols:
+                if c.lower() == pref:
+                    self.cmb_time.setCurrentText(c); return
+
+    def get_result(self):
+        time_col = self.cmb_time.currentText().strip()
+        tracks = []
+        for name_edit, cx, cy, cz in self.track_widgets:
+            name = name_edit.text().strip()
+            xs, ys, zs = cx.currentText().strip(), cy.currentText().strip(), cz.currentText().strip()
+            if xs and ys and zs and all(c in self.df.columns for c in (xs,ys,zs)):
+                tracks.append( (name or "Track", (xs,ys,zs)) )
+        return time_col, tracks
+
+
 
 # ------------------------- 主窗口/面板 -------------------------
 class MainWindow(QMainWindow):
@@ -399,9 +551,11 @@ class MainWindow(QMainWindow):
         self.traj_list = QListWidget()
         btns = QHBoxLayout()
         self.btn_add_csv = QPushButton("Add CSV(s)…")
+        self.btn_add_mapped = QPushButton("Add + Map…")   # 新增
         self.btn_remove_csv = QPushButton("Remove")
         self.btn_fit = QPushButton("Fit View")
-        btns.addWidget(self.btn_add_csv); btns.addWidget(self.btn_remove_csv); btns.addWidget(self.btn_fit)
+        btns.addWidget(self.btn_add_csv); btns.addWidget(self.btn_remove_csv); btns.addWidget(self.btn_fit); btns.addWidget(self.btn_add_mapped)                # 新增
+
         # 轨迹属性区
         prop = QGridLayout()
         self.chk_visible = QCheckBox("Visible")
@@ -458,6 +612,9 @@ class MainWindow(QMainWindow):
         self.cmb_frame.currentTextChanged.connect(self.on_traj_prop_changed)
         self.cmb_cmap.currentTextChanged.connect(self.on_traj_prop_changed)
 
+        self.btn_add_mapped.clicked.connect(self.on_add_mapped)
+
+
         self.btn_add_obs.clicked.connect(self.on_add_obs)
         self.btn_del_obs.clicked.connect(self.on_del_obs)
         self.obs_list.currentRowChanged.connect(self.on_select_obs)
@@ -494,6 +651,39 @@ class MainWindow(QMainWindow):
         self.traj_list.takeItem(row)
         self.gl.trajectories.pop(row)
         self.gl.update()
+
+    def on_add_mapped(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            dlg = ColumnMapDialog(path, self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            time_col, tracks = dlg.get_result()
+            if not tracks:
+                QtWidgets.QMessageBox.information(self, "Empty", "未选择任何三元组。")
+                return
+            created = 0
+            for name, (cx,cy,cz) in tracks:
+                traj = Trajectory(
+                    path=path,
+                    name=f"{os.path.basename(path)} [{name}]",
+                    time_col=time_col,
+                    xyz_cols=(cx,cy,cz)
+                )
+                traj.load()
+                self.gl.trajectories.append(traj)
+                item = QListWidgetItem(traj.name)
+                item.setCheckState(QtCore.Qt.Checked)
+                self.traj_list.addItem(item)
+                created += 1
+            if created:
+                self.gl.fit_to_scene()
+                self.gl.update()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Load error", f"{path}\n{e}")
+
 
     def on_select_traj(self, row: int):
         if row < 0 or row >= len(self.gl.trajectories):
