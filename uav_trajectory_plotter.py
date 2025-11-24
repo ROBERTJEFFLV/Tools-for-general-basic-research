@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import QOpenGLWidget  # 改为从 QtWidgets 导入
 
 from OpenGL.GL import *
 from OpenGL.GLU import *
+import ctypes
 
 # ------------------------- 检测/转换工具 -------------------------
 CANDIDATE_T = ["t", "t_s", "time", "sec", "secs", "seconds", "timestamp", "true_time"]
@@ -132,6 +133,9 @@ class Trajectory:
     xyz: Optional[np.ndarray] = None
     colors: Optional[np.ndarray] = None
 
+    # VBO 相关（由 GLWidget 管理）
+    vbo_id: Optional[int] = None
+
     def load(self):
         df = pd.read_csv(self.path)
         # 去掉无名索引列
@@ -174,7 +178,10 @@ class Trajectory:
                 x, y, z = ned_to_enu(x_raw, y_raw, z_raw)
             else:
                 x, y, z = x_raw, y_raw, z_raw
+        # 先按时间均匀选最多 120k 点
         idx = _downsample_idx(len(t_raw), 120_000)
+        # 再针对渲染做更激进下采样，最多 20k 点（GPU 友好）
+        idx = idx[_downsample_idx(len(idx), 20_000)]
         self.t = t_raw[idx]
         self.xyz = np.stack([x[idx], y[idx], z[idx]], axis=1)
         t01 = (self.t - self.t.min()) / max(1e-12, (self.t.max() - self.t.min()))
@@ -213,12 +220,25 @@ class GLWidget(QOpenGLWidget):
         self._left_down = False
         self._mid_down = False
 
+        # 记住一个"默认视角"，便于一键恢复
+        self._default_target = self.target.copy()
+        self._default_distance = self.distance
+        self._default_yaw = self.yaw
+        self._default_pitch = self.pitch
+
+        # VBO 管理：存储已创建的 VBO ID
+        self._vbo_map = {}  # traj -> vbo_id
+
     # ---- OpenGL 生命周期 ----
     def initializeGL(self):
         glClearColor(1, 1, 1, 1)
         glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_TRUE)
         glDisable(GL_CULL_FACE)
         glLineWidth(2.0)
+        # 启用客户端状态（VBO 需要）
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glEnableClientState(GL_COLOR_ARRAY)
 
     def resizeGL(self, w, h):
         glViewport(0, 0, max(1, w), max(1, h))
@@ -245,15 +265,11 @@ class GLWidget(QOpenGLWidget):
         self._draw_grid()
         self._draw_axes()
 
-        # 轨迹
+        # 轨迹（VBO 绘制）
         for traj in self.trajectories:
             if not traj.visible or traj.xyz is None or traj.colors is None:
                 continue
-            glBegin(GL_LINE_STRIP)
-            for (x, y, z), c in zip(traj.xyz, traj.colors):
-                glColor3f(c[0], c[1], c[2])
-                glVertex3f(x, y, z)
-            glEnd()
+            self._draw_trajectory_vbo(traj)
 
         # 障碍物
         for shp in self.shapes:
@@ -261,14 +277,16 @@ class GLWidget(QOpenGLWidget):
 
     # ---- 绘制帮助 ----
     def _draw_grid(self, extent=40, step=1.0):
+        # 轻微下移到 z=-0.05，避免与轨迹 z=0 完全共面时被深度测试“抖掉”
         glColor3f(0.92, 0.92, 0.92)
+        z0 = -0.05
         glBegin(GL_LINES)
         for i in range(-extent, extent + 1):
             x = i * step
-            glVertex3f(x, -extent * step, 0)
-            glVertex3f(x,  extent * step, 0)
-            glVertex3f(-extent * step, x, 0)
-            glVertex3f( extent * step, x, 0)
+            glVertex3f(x, -extent * step, z0)
+            glVertex3f(x,  extent * step, z0)
+            glVertex3f(-extent * step, x, z0)
+            glVertex3f( extent * step, x, z0)
         glEnd()
 
     def _draw_axes(self, L=1.5):
@@ -278,7 +296,32 @@ class GLWidget(QOpenGLWidget):
         glColor3f(0, 0, 1); glVertex3f(0, 0, 0); glVertex3f(0, 0, L)  # Z 蓝
         glEnd()
 
+    def _draw_trajectory_vbo(self, traj: Trajectory):
+        """用 VBO 高效绘制轨迹（避免 Python for-loop）"""
+        traj_id = id(traj)  # 使用对象 ID 作为字典键
+        if traj_id not in self._vbo_map:
+            # 首次绘制，创建并上传 VBO
+            n = len(traj.xyz)
+            # 交错布局：[x,y,z, r,g,b, x,y,z, r,g,b, ...]
+            data = np.empty((n, 6), dtype=np.float32)
+            data[:, :3] = traj.xyz
+            data[:, 3:] = traj.colors
+            vbo_id = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_id)
+            glBufferData(GL_ARRAY_BUFFER, data.nbytes, data, GL_STATIC_DRAW)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self._vbo_map[traj_id] = vbo_id
+            traj.vbo_id = vbo_id
+        else:
+            vbo_id = self._vbo_map[traj_id]
 
+        # 绘制
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_id)
+        stride = 6 * 4  # 6 个 float32 = 24 字节
+        glVertexPointer(3, GL_FLOAT, stride, None)
+        glColorPointer(3, GL_FLOAT, stride, ctypes.c_void_p(3 * 4))
+        glDrawArrays(GL_LINE_STRIP, 0, len(traj.xyz))
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     def _draw_shape(self, shp: Shape):
         glPushMatrix()
@@ -402,7 +445,16 @@ class GLWidget(QOpenGLWidget):
         size = np.linalg.norm(maxs - mins)
         if size < 1e-6: size = 1.0
         self.target = center
-        self.distance = max(3.0, size * 0.8)
+        # 适当减小系数，避免摄像机过远导致地面网格太小
+        self.distance = max(3.0, size * 0.6)
+        self.update()
+
+    # 公共：恢复到一个“正常”的（初始）视角
+    def reset_view(self):
+        self.target = self._default_target.copy()
+        self.distance = self._default_distance
+        self.yaw = self._default_yaw
+        self.pitch = self._default_pitch
         self.update()
 
 class ColumnMapDialog(QDialog):
@@ -554,7 +606,12 @@ class MainWindow(QMainWindow):
         self.btn_add_mapped = QPushButton("Add + Map…")   # 新增
         self.btn_remove_csv = QPushButton("Remove")
         self.btn_fit = QPushButton("Fit View")
-        btns.addWidget(self.btn_add_csv); btns.addWidget(self.btn_remove_csv); btns.addWidget(self.btn_fit); btns.addWidget(self.btn_add_mapped)                # 新增
+        self.btn_reset_view = QPushButton("Reset View")   # 新增：视角恢复按钮
+        btns.addWidget(self.btn_add_csv)
+        btns.addWidget(self.btn_remove_csv)
+        btns.addWidget(self.btn_fit)
+        btns.addWidget(self.btn_reset_view)
+        btns.addWidget(self.btn_add_mapped)                # 新增
 
         # 轨迹属性区
         prop = QGridLayout()
@@ -607,6 +664,7 @@ class MainWindow(QMainWindow):
         self.btn_add_csv.clicked.connect(self.on_add_csv)
         self.btn_remove_csv.clicked.connect(self.on_remove_csv)
         self.btn_fit.clicked.connect(self.gl.fit_to_scene)
+        self.btn_reset_view.clicked.connect(self.gl.reset_view)
         self.traj_list.currentRowChanged.connect(self.on_select_traj)
         self.chk_visible.toggled.connect(self.on_traj_prop_changed)
         self.cmb_frame.currentTextChanged.connect(self.on_traj_prop_changed)
